@@ -3,6 +3,7 @@ import { TransactionStatus } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service.js';
 import { NetwalletpayProvider } from '../providers/netwalletpay.provider.js';
 import { ZikoPayProvider } from '../providers/zikopay.provider.js';
+import { classifyFailure } from '../../common/failure-category.js';
 import { BlinkApiService } from '../providers/services/blink-api.service.js';
 import { PayoutExecutorService } from './payout-executor.service.js';
 import { PaymentEventService } from './payment-event.service.js';
@@ -243,7 +244,7 @@ export class PaymentPollingService implements OnApplicationBootstrap {
     });
     await this.prisma.paymentInvoice.update({
       where: { id: job.invoiceId },
-      data: { status: TransactionStatus.FAILED },
+      data: { status: TransactionStatus.FAILED, failureCategory: classifyFailure(reason) },
     });
     await this.prisma.paymentRequest.updateMany({
       where: {

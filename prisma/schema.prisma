@@ -756,6 +756,11 @@ model PaymentInvoice {
 
   status TransactionStatus @default(PENDING)
 
+  // For FAILED invoices: ABANDONED (customer never completed) | DECLINED
+  // (customer rejected the prompt) | SYSTEM (our system / the provider errored).
+  // Lets analytics separate customer behaviour from real system reliability.
+  failureCategory String?
+
   expiresAt DateTime
 
   createdById String? // optional (payer)

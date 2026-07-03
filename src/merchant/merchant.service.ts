@@ -4,6 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { UserSettingsService } from '../users/services/user-settings.service.js';
 import { ApplyMerchantDto } from './dto/apply-merchant.dto.js';
 import { getXafRates, toXaf } from '../common/fx-convert.js';
+import { bucketInvoice } from '../common/failure-category.js';
 
 type AnalyticsPeriod = '7d' | '30d' | '90d';
 
@@ -259,6 +260,9 @@ export class MerchantService {
         amount: true,
         createdById: true,
         createdAt: true,
+        expiresAt: true,
+        failureCategory: true,
+        attempts: { orderBy: { createdAt: 'desc' }, take: 1, select: { failureReason: true } },
         quote: {
           select: {
             baseAmount: true,
@@ -290,6 +294,9 @@ export class MerchantService {
     const countryMap = new Map<string, { count: number; volume: number }>();
     const corridorMap = new Map<string, { count: number; volume: number }>();
     const payerIds = new Set<string>();
+    // Outcome buckets — separate customer behaviour from real system reliability.
+    const outcomes = { success: 0, abandoned: 0, declined: 0, system: 0, inprogress: 0 };
+    const now = new Date();
 
     // Payments settle in the payer's currency — convert each to an approximate
     // XAF figure so the single volume total is meaningful (display-only).
@@ -301,6 +308,13 @@ export class MerchantService {
       const ccy = inv.currency?.code ?? 'XAF';
       const amount = toXaf(Number(inv.amount), ccy, fxRates);
       const fee = toXaf(Number(inv.quote?.fee ?? 0), inv.quote?.baseCurrency?.code ?? ccy, fxRates);
+
+      outcomes[bucketInvoice({
+        status: inv.status,
+        failureCategory: inv.failureCategory,
+        latestFailureReason: inv.attempts[0]?.failureReason ?? null,
+        expired: inv.expiresAt ? inv.expiresAt < now : false,
+      })] += 1;
 
       row.total++;
       row.volume += amount;
@@ -361,6 +375,21 @@ export class MerchantService {
         avgTransactionValue:
           invoices.length > 0 ? Math.round(totalVolume / invoices.length) : 0,
         uniquePayers: payerIds.size,
+        // Four-bucket outcome breakdown — separates customer behaviour from
+        // real reliability. `systemSuccessRate` is the true strength of the
+        // system (successes vs only the failures we/our providers caused).
+        outcomes,
+        systemSuccessRate:
+          outcomes.success + outcomes.system > 0
+            ? Math.round((outcomes.success / (outcomes.success + outcomes.system)) * 100)
+            : 0,
+        // Of everything that reached a final state, how many succeeded.
+        overallConversion:
+          invoices.length - outcomes.inprogress > 0
+            ? Math.round(
+                (outcomes.success / (invoices.length - outcomes.inprogress)) * 100,
+              )
+            : 0,
       },
       txChart: dates.map((date) => ({ date, ...(txMap.get(date)!) })),
       byPaymentMethod: Array.from(methodMap.entries())

@@ -12,6 +12,7 @@ import { NetwalletpayProvider } from '../payment/providers/netwalletpay.provider
 import { ZikoPayProvider } from '../payment/providers/zikopay.provider.js';
 import { UserStatusCacheService } from '../redis/user-status-cache.service.js';
 import { getXafRates, toXaf } from '../common/fx-convert.js';
+import { bucketInvoice, classifyFailure, explainOutcome } from '../common/failure-category.js';
 
 type AdminActionTarget = 'USER' | 'INVOICE' | 'KYC' | 'PRICING' | 'SYSTEM' | 'REFUND' | 'WITHDRAWAL' | 'MERCHANT';
 
@@ -103,6 +104,7 @@ export class AdminService {
       successInvoices,
       failedInvoices,
       pendingInvoices,
+      failedRows,
       pendingKyc,
       totalVolumeCm,
       recentInvoices,
@@ -115,6 +117,15 @@ export class AdminService {
       this.prisma.paymentInvoice.count({ where: { status: 'FAILED' } }),
       this.prisma.paymentInvoice.count({
         where: { status: { in: ['PENDING', 'PROCESSING'] } },
+      }),
+      // Failed invoices with enough info to tell system faults from customer
+      // behaviour (stored category, or heuristic on the latest attempt reason).
+      this.prisma.paymentInvoice.findMany({
+        where: { status: 'FAILED' },
+        select: {
+          failureCategory: true,
+          attempts: { orderBy: { createdAt: 'desc' }, take: 1, select: { failureReason: true } },
+        },
       }),
       this.prisma.kyc.count({ where: { status: 'PENDING' } }),
       // Total volume in XAF (successful invoices)
@@ -133,6 +144,12 @@ export class AdminService {
       }),
     ]);
 
+    // Failures we/our providers caused — the ones that reflect on reliability.
+    const systemFailed = failedRows.filter(
+      (r) =>
+        (r.failureCategory ?? classifyFailure(r.attempts[0]?.failureReason)) === 'SYSTEM',
+    ).length;
+
     return {
       users: { total: totalUsers, active: activeUsers, admins: adminUsers },
       invoices: {
@@ -140,8 +157,14 @@ export class AdminService {
         success: successInvoices,
         failed: failedInvoices,
         pending: pendingInvoices,
+        systemFailed,
         successRate:
           totalInvoices > 0 ? Math.round((successInvoices / totalInvoices) * 100) : 0,
+        // True reliability: successes vs only the failures we caused.
+        systemSuccessRate:
+          successInvoices + systemFailed > 0
+            ? Math.round((successInvoices / (successInvoices + systemFailed)) * 100)
+            : 0,
       },
       kyc: { pending: pendingKyc },
       volume: {
@@ -288,10 +311,17 @@ export class AdminService {
     const skip = (page - 1) * limit;
     const stalledCutoff = new Date(Date.now() - 5 * 60_000);
 
+    // `type` doubles as a failure-category filter so admins can zero in on the
+    // debugging queue (SYSTEM) vs customer drop-offs (ABANDONED/DECLINED).
+    const CATEGORY_FILTERS = ['SYSTEM', 'DECLINED', 'ABANDONED'];
     const statusOr: Record<string, unknown>[] = [];
-    if (type === 'FAILED' || type === 'ALL') statusOr.push({ status: 'FAILED' });
-    if (type === 'STALLED' || type === 'ALL') {
-      statusOr.push({ status: 'PROCESSING', updatedAt: { lt: stalledCutoff } });
+    if (CATEGORY_FILTERS.includes(type)) {
+      statusOr.push({ status: 'FAILED', failureCategory: type });
+    } else {
+      if (type === 'FAILED' || type === 'ALL') statusOr.push({ status: 'FAILED' });
+      if (type === 'STALLED' || type === 'ALL') {
+        statusOr.push({ status: 'PROCESSING', updatedAt: { lt: stalledCutoff } });
+      }
     }
 
     const where: Record<string, unknown> = { OR: statusOr };
@@ -348,11 +378,25 @@ export class AdminService {
           : inv.attempts.length === 0
             ? 'Stalled — payer never started the payment'
             : 'Stalled — pay-in attempted but never confirmed (lost webhook/poll)';
+        // Classify who caused it so bug-fixers can separate our faults from
+        // customer drop-offs.
+        const insight = explainOutcome({
+          status: inv.status,
+          failureCategory: inv.failureCategory,
+          latestFailureReason: latest?.failureReason,
+          expired: new Date() > inv.expiresAt,
+          hasAttempt: inv.attempts.length > 0,
+        });
         return {
           id: inv.id,
           reference: inv.reference,
           type: isFailed ? 'FAILED' : 'STALLED',
           status: inv.status,
+          category: insight.category,
+          categoryLabel: insight.label,
+          blame: insight.blame,
+          explanation: insight.detail,
+          headline: insight.headline,
           flow: inv.flow,
           kind: inv.merchantPaymentLink?.kind ?? null,
           title: inv.merchantPaymentLink?.title ?? inv.description ?? null,
@@ -405,15 +449,21 @@ export class AdminService {
     status?: string;
     flow?: string;
     country?: string;
+    category?: string;
     search?: string;
   }) {
-    const { page, limit, status, flow, country, search } = params;
+    const { page, limit, status, flow, country, category, search } = params;
     const skip = (page - 1) * limit;
 
     const where: Record<string, unknown> = {};
     if (status) where.status = status;
     if (flow) where.flow = flow;
     if (country) where.country = country;
+    // Filter to a specific failure category (the debugging queue).
+    if (category && ['SYSTEM', 'DECLINED', 'ABANDONED'].includes(category.toUpperCase())) {
+      where.status = 'FAILED';
+      where.failureCategory = category.toUpperCase();
+    }
     if (search) {
       where.OR = [
         { reference: { contains: search, mode: 'insensitive' } },
@@ -440,27 +490,38 @@ export class AdminService {
     ]);
 
     return {
-      data: invoices.map((inv) => ({
-        id: inv.id,
-        reference: inv.reference,
-        amount: Number(inv.amount),
-        currency: inv.currency,
-        description: inv.description,
-        status: inv.status,
-        flow: inv.flow,
-        paymentMethod: inv.paymentMethod,
-        payoutMethod: inv.payoutMethod,
-        country: inv.country,
-        recipientPhone: inv.recipientPhone,
-        recipientName: inv.recipientName,
-        createdBy: inv.createdBy,
-        recipient: inv.recipient,
-        payout: inv.payout,
-        latestAttempt: inv.attempts[0] ?? null,
-        expiresAt: inv.expiresAt,
-        createdAt: inv.createdAt,
-        updatedAt: inv.updatedAt,
-      })),
+      data: invoices.map((inv) => {
+        const insight = explainOutcome({
+          status: inv.status,
+          failureCategory: inv.failureCategory,
+          latestFailureReason: inv.attempts[0]?.failureReason,
+          expired: new Date() > inv.expiresAt,
+          hasAttempt: inv.attempts.length > 0,
+        });
+        return {
+          id: inv.id,
+          reference: inv.reference,
+          amount: Number(inv.amount),
+          currency: inv.currency,
+          description: inv.description,
+          status: inv.status,
+          flow: inv.flow,
+          paymentMethod: inv.paymentMethod,
+          payoutMethod: inv.payoutMethod,
+          country: inv.country,
+          recipientPhone: inv.recipientPhone,
+          recipientName: inv.recipientName,
+          createdBy: inv.createdBy,
+          recipient: inv.recipient,
+          payout: inv.payout,
+          latestAttempt: inv.attempts[0] ?? null,
+          // Outcome classification (system vs customer) for at-a-glance triage.
+          outcome: { category: insight.category, label: insight.label, blame: insight.blame },
+          expiresAt: inv.expiresAt,
+          createdAt: inv.createdAt,
+          updatedAt: inv.updatedAt,
+        };
+      }),
       meta: { total, page, limit, pages: Math.ceil(total / limit) },
     };
   }
@@ -512,11 +573,28 @@ export class AdminService {
     const paymentInstrument = this.paymentInstrumentFromAttempt(latestAttempt);
     const refundCandidate = this.serializeRefundableInvoice(inv, transaction, invoiceRefundLogs);
 
+    // Plain-English "what happened and whose fault" — separates our/provider
+    // faults (needs engineering) from customer drop-offs.
+    const insight = explainOutcome({
+      status: inv.status,
+      failureCategory: inv.failureCategory,
+      latestFailureReason: latestAttempt?.failureReason,
+      expired: inv.expiresAt ? new Date() > new Date(inv.expiresAt) : false,
+      hasAttempt: (inv.attempts?.length ?? 0) > 0,
+    });
+
     return {
       id: inv.id,
       reference: inv.reference,
       description: inv.description,
       status: inv.status,
+      failureInsight: {
+        category: insight.category,
+        label: insight.label,
+        blame: insight.blame,
+        headline: insight.headline,
+        detail: insight.detail,
+      },
       country: inv.country,
       flow: inv.flow,
       paymentMethod: inv.paymentMethod,
@@ -625,6 +703,9 @@ export class AdminService {
         fee: this.numberValue(attempt.fee ?? null, null),
         netAmount: this.numberValue(attempt.netAmount ?? null, null),
         failureReason: attempt.failureReason,
+        // Raw provider payload + attempt metadata for deep debugging.
+        providerResponse: attempt.providerResponse ?? null,
+        metadata: attempt.metadata ?? null,
         instrument: this.paymentInstrumentFromAttempt(attempt),
         createdAt: attempt.createdAt,
         updatedAt: attempt.updatedAt,
@@ -1091,6 +1172,9 @@ export class AdminService {
           country: true,
           amount: true,
           createdAt: true,
+          expiresAt: true,
+          failureCategory: true,
+          attempts: { orderBy: { createdAt: 'desc' }, take: 1, select: { failureReason: true } },
           quote: {
             select: {
               baseAmount: true,
@@ -1127,6 +1211,9 @@ export class AdminService {
     const methodMap = new Map<string, { count: number; volume: number }>();
     const countryMap = new Map<string, { count: number; volume: number }>();
     const corridorMap = new Map<string, { count: number; volume: number }>();
+    // Outcome buckets — separate customer behaviour from real system reliability.
+    const outcomes = { success: 0, abandoned: 0, declined: 0, system: 0, inprogress: 0 };
+    const now = new Date();
 
     // Volumes are converted to an approximate XAF figure since payments settle
     // in many currencies (display-only single total).
@@ -1138,6 +1225,13 @@ export class AdminService {
       const ccy = inv.quote?.baseCurrency?.code ?? 'XAF';
       const amount = toXaf(Number(inv.quote?.baseAmount ?? inv.amount), ccy, fxRates);
       const fee = toXaf(Number(inv.quote?.fee ?? 0), ccy, fxRates);
+
+      outcomes[bucketInvoice({
+        status: inv.status,
+        failureCategory: inv.failureCategory,
+        latestFailureReason: inv.attempts[0]?.failureReason ?? null,
+        expired: inv.expiresAt ? inv.expiresAt < now : false,
+      })] += 1;
 
       row.total++;
       row.volume += amount;
@@ -1194,6 +1288,21 @@ export class AdminService {
           invoices.length > 0 ? Math.round(totalVolume / invoices.length) : 0,
         newUsers: newUsers.length,
         totalUsers,
+        // Four-bucket outcome breakdown — separates customer behaviour from
+        // real reliability. `systemSuccessRate` is the true strength of the
+        // system (successes vs only the failures we/our providers caused).
+        outcomes,
+        systemSuccessRate:
+          outcomes.success + outcomes.system > 0
+            ? Math.round((outcomes.success / (outcomes.success + outcomes.system)) * 100)
+            : 0,
+        // Of everything that reached a final state, how many succeeded.
+        overallConversion:
+          invoices.length - outcomes.inprogress > 0
+            ? Math.round(
+                (outcomes.success / (invoices.length - outcomes.inprogress)) * 100,
+              )
+            : 0,
       },
       txChart: dates.map((date) => ({ date, ...(txMap.get(date)!) })),
       userChart: dates.map((date) => ({ date, count: userMap.get(date) ?? 0 })),

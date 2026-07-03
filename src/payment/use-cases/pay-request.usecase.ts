@@ -6,6 +6,7 @@ import { FlowType } from '../enums/payment.enums.js';
 import { QuoteService } from '../../quote/quote.service.js';
 import { PaymentEventService } from '../services/payment-event.service.js';
 import { PaymentPollingService, PollingProvider } from '../services/payment-polling.service.js';
+import { classifyFailure } from '../../common/failure-category.js';
 
 type QuoteWithCurrencies = Prisma.QuoteGetPayload<{
   include: { baseCurrency: true; targetCurrency: true };
@@ -222,7 +223,9 @@ export class PayRequestUseCase {
       });
       await this.prisma.paymentInvoice.update({
         where: { id: invoice.id },
-        data: { status: TransactionStatus.FAILED },
+        // Provider rejected the request outright (no prompt reached the payer) —
+        // classify (usually SYSTEM, e.g. a provider errorCode).
+        data: { status: TransactionStatus.FAILED, failureCategory: classifyFailure(payinResponse?.error, payinResponse?.status) },
       });
       if (paymentRequest) {
         await this.prisma.paymentRequest.update({

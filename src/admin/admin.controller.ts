@@ -110,7 +110,7 @@ export class AdminController {
   @ApiOperation({ summary: 'Failed + stalled payments with full diagnostic detail (failure reason + raw provider response)' })
   @ApiQuery({ name: 'page',  required: false })
   @ApiQuery({ name: 'limit', required: false })
-  @ApiQuery({ name: 'type',  required: false, description: 'FAILED | STALLED | ALL' })
+  @ApiQuery({ name: 'type',  required: false, description: 'ALL | FAILED | STALLED | SYSTEM | DECLINED | ABANDONED' })
   @ApiQuery({ name: 'search', required: false })
   getPaymentIssues(
     @Query('page',  new DefaultValuePipe(1),  ParseIntPipe) page: number,
@@ -128,6 +128,7 @@ export class AdminController {
   @ApiQuery({ name: 'status',  required: false })
   @ApiQuery({ name: 'flow',    required: false })
   @ApiQuery({ name: 'country', required: false })
+  @ApiQuery({ name: 'category', required: false, description: 'SYSTEM | DECLINED | ABANDONED (failed only)' })
   @ApiQuery({ name: 'search',  required: false })
   listInvoices(
     @Query('page',    new DefaultValuePipe(1),  ParseIntPipe) page: number,
@@ -135,9 +136,10 @@ export class AdminController {
     @Query('status')  status?: string,
     @Query('flow')    flow?: string,
     @Query('country') country?: string,
+    @Query('category') category?: string,
     @Query('search')  search?: string,
   ) {
-    return this.admin.listInvoices({ page, limit: Math.min(limit, 100), status, flow, country, search });
+    return this.admin.listInvoices({ page, limit: Math.min(limit, 100), status, flow, country, category, search });
   }
 
   @Get('invoices/:id')

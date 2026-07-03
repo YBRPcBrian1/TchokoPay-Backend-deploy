@@ -14,6 +14,7 @@ import { PrismaService } from '../../../prisma/prisma.service.js';
 import { PaymentEventService } from '../services/payment-event.service.js';
 import { PayoutExecutorService } from '../services/payout-executor.service.js';
 import { PaymentPollingService, PollingProvider } from '../services/payment-polling.service.js';
+import { classifyFailure } from '../../common/failure-category.js';
 
 @ApiTags('Webhooks')
 @Controller('webhooks')
@@ -303,7 +304,7 @@ export class WebhookController {
 
     await this.prisma.paymentInvoice.update({
       where: { id: attempt.invoiceId },
-      data: { status: TransactionStatus.FAILED },
+      data: { status: TransactionStatus.FAILED, failureCategory: classifyFailure(reason || status, status) },
     });
     await this.prisma.paymentRequest.updateMany({
       where: {
@@ -413,7 +414,7 @@ export class WebhookController {
 
     await this.prisma.paymentInvoice.update({
       where: { id: attempt.invoiceId },
-      data: { status: TransactionStatus.FAILED },
+      data: { status: TransactionStatus.FAILED, failureCategory: classifyFailure(reason, reason) },
     });
     await this.prisma.paymentRequest.updateMany({
       where: {
