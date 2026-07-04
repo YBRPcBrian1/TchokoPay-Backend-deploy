@@ -14,7 +14,42 @@ export class PaymentService {
   ) {}
 
   async processPayment(userId: string, dto: CreatePaymentDto) {
-    return this.flowHelper.execute(userId, dto);
+    const result = await this.flowHelper.execute(userId, dto);
+    await this.attachConfirmInstruction(result, dto);
+    return result;
+  }
+
+  /**
+   * Attaches the operator's "how to finish the payment" hint (from the
+   * PaymentProvider row) to the initiation response, so the checkout "check
+   * your phone" screen can guide the payer and cut abandoned payments.
+   * Best-effort and mobile-money only — never blocks a payment.
+   */
+  private async attachConfirmInstruction(result: any, dto: CreatePaymentDto) {
+    try {
+      const method = (dto.paymentMethod || '').toUpperCase();
+      if (!result?.payment || !['MOMO', 'ORANGE'].includes(method)) return;
+
+      const code = (dto as any).paymentProviderCode?.trim();
+      const iso2 = ((dto as any).payerCountry || (dto as any).country)?.trim()?.toUpperCase();
+
+      const providerRow = code
+        ? await this.prisma.paymentProvider.findUnique({
+            where: { providerCode: code },
+            select: { confirmInstruction: true },
+          })
+        : iso2
+          ? await this.prisma.paymentProvider.findFirst({
+              where: { isActive: true, country: { iso2 }, method: { code: 'MOBILE_MONEY' } },
+              select: { confirmInstruction: true },
+              orderBy: { aggregator: { priority: 'asc' } },
+            })
+          : null;
+
+      result.payment.confirmInstruction = providerRow?.confirmInstruction ?? null;
+    } catch {
+      // Hint is purely cosmetic — swallow any lookup error.
+    }
   }
 
   async verifyProviders(paymentType: string, method: string, country: string) {

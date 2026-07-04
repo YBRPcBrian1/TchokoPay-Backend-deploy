@@ -408,6 +408,10 @@ model PaymentProvider {
   method       PaymentMethodRef  @relation(fields: [methodId], references: [id])
   requiresType Boolean           @default(false)
   isActive     Boolean           @default(true)
+  /// Operator-specific instruction shown on the "check your phone" screen to
+  /// help payers finish (e.g. "Didn't get a prompt? Dial *126# and approve the
+  /// pending payment."). Null → the payer sees a generic fallback message.
+  confirmInstruction String?
   userPaymentPhoneSettings UserPaymentPhoneSettings[]
 
   createdAt DateTime @default(now())
